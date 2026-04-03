@@ -11,7 +11,7 @@ import re
 import httpx
 
 # Long timeout — MRF files are huge, initial connection can be slow
-_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0), follow_redirects=True)
+_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=270.0, write=30.0, pool=30.0), follow_redirects=True)
 
 # Known insurer MRF Table of Contents URLs
 INSURER_TOC_URLS = {
@@ -22,8 +22,10 @@ INSURER_TOC_URLS = {
     "bcbs_nc": "https://www.bcbsnc.com/assets/toc/2024-10-01_BlueCross-and-BlueShield-of-North-Carolina_index.json.gz",
 }
 
-# Max bytes to stream through (2GB compressed ≈ 10-20GB decompressed)
-MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024  # 2GB of compressed data
+# Max bytes to stream through (4GB compressed ≈ 20-40GB decompressed)
+# Claude.ai MCP timeout is 5 min. At ~50MB/s CDN speed, 4GB = ~80s download.
+# With decompression + search overhead, ~3.5 min total. Leaves ~90s margin.
+MAX_STREAM_BYTES = 4 * 1024 * 1024 * 1024  # 4GB of compressed data
 # Rolling buffer size for text search
 BUFFER_SIZE = 64 * 1024  # 64KB chunks
 OVERLAP = 4096  # Overlap between chunks to catch matches at boundaries
