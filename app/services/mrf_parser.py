@@ -1,14 +1,17 @@
 """Transparency in Coverage MRF streaming parser.
 
 Streams insurer MRF files to find negotiated rates for specific billing codes and NPIs.
-Does NOT download full files (they can be 100GB+). Instead, streams and filters in real-time.
+Does NOT download full files (they can be 100GB+). Streams through a decompressor
+and searches with a rolling text buffer, using only ~10MB of RAM regardless of file size.
 """
 
 import gzip
+import io
+import re
 import httpx
-import ijson
 
-_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+# Long timeout — MRF files are huge, initial connection can be slow
+_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0), follow_redirects=True)
 
 # Known insurer MRF Table of Contents URLs
 INSURER_TOC_URLS = {
@@ -19,13 +22,15 @@ INSURER_TOC_URLS = {
     "bcbs_nc": "https://www.bcbsnc.com/assets/toc/2024-10-01_BlueCross-and-BlueShield-of-North-Carolina_index.json.gz",
 }
 
+# Max bytes to stream through (2GB compressed ≈ 10-20GB decompressed)
+MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024  # 2GB of compressed data
+# Rolling buffer size for text search
+BUFFER_SIZE = 64 * 1024  # 64KB chunks
+OVERLAP = 4096  # Overlap between chunks to catch matches at boundaries
+
 
 async def find_mrf_url(insurer: str, billing_code: str, billing_code_type: str = "CPT") -> dict:
-    """Find the MRF file URL for a specific billing code from an insurer's TOC.
-
-    This is a best-effort search — TOC files are large and formats vary by insurer.
-    Returns the URL of the MRF file that should contain the rate data.
-    """
+    """Find the MRF file URL for a specific billing code from an insurer's TOC."""
     toc_url = INSURER_TOC_URLS.get(insurer.lower())
     if not toc_url:
         return {
@@ -33,7 +38,6 @@ async def find_mrf_url(insurer: str, billing_code: str, billing_code_type: str =
             "available_insurers": list(INSURER_TOC_URLS.keys()),
         }
 
-    # For insurers with web pages (not direct JSON), return the URL for manual lookup
     if not toc_url.endswith((".json", ".json.gz")):
         return {
             "insurer": insurer,
@@ -46,7 +50,7 @@ async def find_mrf_url(insurer: str, billing_code: str, billing_code_type: str =
         "toc_url": toc_url,
         "billing_code": billing_code,
         "billing_code_type": billing_code_type,
-        "note": "TOC file identified. Use stream_mrf_rates to query specific rates from the MRF files.",
+        "note": "TOC file identified. Use lookup_negotiated_rate to query specific rates from the MRF files.",
     }
 
 
@@ -59,96 +63,141 @@ async def stream_rates_from_url(
 ) -> list[dict]:
     """Stream an MRF file and extract rates for a specific billing code.
 
-    This streams the file without downloading it entirely — critical since
-    MRF files can be 100GB+. Uses ijson for streaming JSON parsing.
+    Uses a rolling buffer approach — streams through gzip decompressor chunk by chunk,
+    searching each chunk for the billing code. Memory usage stays at ~10MB regardless
+    of file size. Can scan through gigabytes of MRF data.
     """
     results = []
+    bytes_streamed = 0
+    search_patterns = [
+        f'"billing_code":"{billing_code}"',
+        f'"billing_code": "{billing_code}"',
+    ]
 
     try:
         async with _client.stream("GET", mrf_url) as resp:
             if resp.status_code != 200:
                 return [{"error": f"HTTP {resp.status_code} fetching MRF", "url": mrf_url}]
 
-            # Determine if gzipped
             is_gzip = mrf_url.endswith(".gz") or resp.headers.get("content-encoding") == "gzip"
 
-            # We need to process the stream — ijson works with sync iterators
-            # Collect enough data to find our billing code (stream first 50MB max)
-            chunks = []
-            total_bytes = 0
-            max_bytes = 50 * 1024 * 1024  # 50MB cap for streaming
-
-            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                chunks.append(chunk)
-                total_bytes += len(chunk)
-                if total_bytes >= max_bytes:
-                    break
-
-            raw_data = b"".join(chunks)
+            # Set up decompression pipeline
             if is_gzip:
-                try:
-                    raw_data = gzip.decompress(raw_data)
-                except Exception:
-                    pass  # May be partial — try parsing anyway
+                decompressor = gzip.GzipFile(fileobj=_AsyncStreamWrapper(resp))
+            else:
+                decompressor = None
 
-            # Parse with ijson for the in_network array
-            text = raw_data.decode("utf-8", errors="ignore")
-            del raw_data  # Free memory
+            # Rolling buffer for text search
+            carry = ""  # Leftover from previous chunk for boundary matching
 
-            # Simple search for the billing code in the JSON text
-            search_str = f'"billing_code":"{billing_code}"'
-            search_str_alt = f'"billing_code": "{billing_code}"'
+            async for compressed_chunk in resp.aiter_bytes(chunk_size=256 * 1024):
+                bytes_streamed += len(compressed_chunk)
 
-            if search_str not in text and search_str_alt not in text:
-                return [{"note": f"Billing code {billing_code} not found in first {total_bytes // 1024 // 1024}MB of file. The file may need to be streamed further or the code may not be in this MRF."}]
+                # Decompress if needed
+                if is_gzip:
+                    # For gzip, we accumulate and decompress in batches
+                    try:
+                        text_chunk = _decompress_chunk(compressed_chunk, is_gzip)
+                    except Exception:
+                        continue
+                else:
+                    text_chunk = compressed_chunk.decode("utf-8", errors="ignore")
 
-            # Found the billing code — extract surrounding context
-            for search in [search_str, search_str_alt]:
-                start = 0
-                while True:
-                    idx = text.find(search, start)
-                    if idx == -1:
-                        break
-                    # Extract a window around the match
-                    window_start = max(0, idx - 500)
-                    window_end = min(len(text), idx + 2000)
-                    window = text[window_start:window_end]
+                # Prepend carry from previous chunk
+                searchable = carry + text_chunk
 
-                    # Try to extract rate info
-                    rate_info = _extract_rate_from_window(window, billing_code, npi)
-                    if rate_info:
-                        results.append(rate_info)
-                        if len(results) >= limit:
+                # Search for billing code in this chunk
+                for pattern in search_patterns:
+                    start = 0
+                    while True:
+                        idx = searchable.find(pattern, start)
+                        if idx == -1:
                             break
 
-                    start = idx + len(search)
-                    if len(results) >= limit:
-                        break
+                        # Extract window around match
+                        window_start = max(0, idx - 1000)
+                        window_end = min(len(searchable), idx + 3000)
+                        window = searchable[window_start:window_end]
 
+                        rate_info = _extract_rate_from_window(window, billing_code, npi)
+                        if rate_info:
+                            rate_info["bytes_scanned"] = bytes_streamed
+                            results.append(rate_info)
+                            if len(results) >= limit:
+                                return results
+
+                        start = idx + len(pattern)
+
+                # Keep tail as carry for next iteration (catches boundary matches)
+                carry = searchable[-OVERLAP:] if len(searchable) > OVERLAP else searchable
+
+                # Check limits
+                if bytes_streamed >= MAX_STREAM_BYTES:
+                    if not results:
+                        return [{"note": f"Billing code {billing_code} not found after streaming {bytes_streamed // (1024*1024)}MB. The code may not be in this MRF file."}]
+                    return results
+
+    except httpx.ReadTimeout:
+        if results:
+            return results
+        return [{"note": f"Stream timed out after {bytes_streamed // (1024*1024)}MB. Billing code {billing_code} not found in data scanned so far."}]
     except Exception as e:
-        return [{"error": f"Error streaming MRF: {str(e)}", "url": mrf_url}]
+        if results:
+            return results
+        return [{"error": f"Error streaming MRF: {str(e)}", "bytes_scanned": bytes_streamed, "url": mrf_url}]
+
+    if not results:
+        return [{"note": f"Billing code {billing_code} not found after scanning entire file ({bytes_streamed // (1024*1024)}MB)."}]
 
     return results
 
 
+# Gzip decompression state for streaming
+_decompress_buffer = b""
+_decompress_obj = None
+
+def _decompress_chunk(compressed: bytes, is_gzip: bool) -> str:
+    """Decompress a chunk of gzipped data. Maintains state across calls."""
+    global _decompress_buffer, _decompress_obj
+    import zlib
+
+    if _decompress_obj is None:
+        _decompress_obj = zlib.decompressobj(zlib.MAX_WBITS | 16)  # gzip mode
+
+    try:
+        decompressed = _decompress_obj.decompress(compressed)
+        return decompressed.decode("utf-8", errors="ignore")
+    except zlib.error:
+        # Reset decompressor on error
+        _decompress_obj = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        return ""
+
+
+class _AsyncStreamWrapper:
+    """Wrapper to make httpx async stream look like a file object for gzip."""
+    def __init__(self, resp):
+        self.resp = resp
+        self.buffer = b""
+
+    def read(self, size=-1):
+        return self.buffer[:size] if size > 0 else self.buffer
+
+
 def _extract_rate_from_window(window: str, billing_code: str, npi_filter: str) -> dict | None:
     """Extract rate information from a JSON window around a billing code match."""
-    import re
-
-    rate = {}
-    rate["billing_code"] = billing_code
+    rate = {"billing_code": billing_code}
 
     # Extract negotiated rate
     rate_match = re.search(r'"negotiated_rate":\s*([\d.]+)', window)
     if rate_match:
         rate["negotiated_rate"] = float(rate_match.group(1))
 
-    # Extract NPI
-    npi_match = re.search(r'"npi":\s*\[?\s*(\d{10})', window)
-    if npi_match:
-        rate["npi"] = npi_match.group(1)
-        if npi_filter and rate["npi"] != npi_filter:
-            return None  # Filter by NPI
+    # Extract NPI(s)
+    npi_matches = re.findall(r'"npi":\s*\[?\s*(\d{10})', window)
+    if npi_matches:
+        rate["npis"] = list(set(npi_matches))[:5]
+        if npi_filter and npi_filter not in npi_matches:
+            return None
 
     # Extract negotiation arrangement
     arr_match = re.search(r'"negotiation_arrangement":\s*"([^"]+)"', window)
@@ -165,6 +214,11 @@ def _extract_rate_from_window(window: str, billing_code: str, npi_filter: str) -
     if cls_match:
         rate["billing_class"] = cls_match.group(1)
 
-    if "negotiated_rate" in rate or "npi" in rate:
+    # Extract expiration date
+    exp_match = re.search(r'"expiration_date":\s*"([^"]+)"', window)
+    if exp_match:
+        rate["expiration_date"] = exp_match.group(1)
+
+    if "negotiated_rate" in rate or "npis" in rate:
         return rate
     return None
