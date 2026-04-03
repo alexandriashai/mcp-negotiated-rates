@@ -11,7 +11,7 @@ import re
 import httpx
 
 # Long timeout — MRF files are huge, initial connection can be slow
-_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=270.0, write=30.0, pool=30.0), follow_redirects=True)
+_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=290.0, write=30.0, pool=30.0), follow_redirects=True)
 
 # Known insurer MRF Table of Contents URLs
 INSURER_TOC_URLS = {
